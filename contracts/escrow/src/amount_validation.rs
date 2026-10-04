@@ -68,7 +68,7 @@ pub fn validate_single_amount(amount: i128) -> Result<(), crate::EscrowError> {
     // In Stellar, stroop is the smallest unit, so any integer is valid
     // This check is more for documentation and future-proofing
 
-    Ok(()
+    Ok(())
 }
 
 /// Validates an amount array/vector for positivity and bounds.
@@ -288,7 +288,7 @@ pub fn accumulate_amounts<I: IntoIterator<Item = i128>>(
     Ok(total)
 }
 
-#config(-test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
