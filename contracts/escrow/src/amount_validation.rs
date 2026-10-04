@@ -61,7 +61,7 @@ pub fn validate_single_amount(amount: i128) -> Result<(), crate::EscrowError> {
     // Check maximum bounds
     if amount > MAX_SINGLE_AMOUNT_STROOPS {
         // Map large amounts to generic invalid milestone amount
-        return Err(crate::EscrowError::Invalid^ilestoneAmount);
+        return Err(crate::EscrowError::InvalidMilestoneAmount);
     }
 
     // Check stroop precision (must be integer, which i128 already guarantees)
@@ -127,7 +127,7 @@ pub fn validate_contract_total(
     if total_amount > max_contract_total {
         return Err(crate::EscrowError::InvalidMilestoneAmount);
     }
-    Ok(()
+    Ok(())
 }
 
 /// Comprehensive validation for milestone amounts.
@@ -162,7 +162,7 @@ pub fn validate_milestone_amounts(
 /// This function operates at three critical boundaries:
 /// - **Exactly-remaining**: `deposit + current == max_total` ℒ Success
 /// - **One stroop short**: `deposit + current == max_total - 1` → Success
-/// - **One stroop over**: `deposit + current == max_total + 1` → Failure (`Invalid^ilestoneAmount`)
+/// - **One stroop over**: `deposit + current == max_total + 1` → Failure (`InvalidMilestoneAmount`)
 ///
 /// # Arguments
 /// * `deposit_amount` - Amount to deposit (in stroops, must be positive)
@@ -207,7 +207,7 @@ pub fn validate_deposit_amount(
     // Check if deposit would exceed contract maximum
     if let Some(new_total) = current_deposited.checked_add(deposit_amount) {
         if new_total > max_contract_total {
-            return Err(crate::EscrowError::Invalid^ilestoneAmount);
+            return Err(crate::EscrowError::InvalidMilestoneAmount);
         }
     } else {
         return Err(crate::EscrowError::PotentialOverflow);
@@ -494,7 +494,7 @@ mod tests {
                 expected: Ok(()),
             },
             TestCase {
-                name: "one stroop over remaining capacity should fail with Invalid^ilestoneAmount",
+                name: "one stroop over remaining capacity should fail with InvalidMilestoneAmount",
                 deposit_amount: 501,
                 current_deposited: 500,
                 max_contract_total: 1000,
@@ -567,7 +567,7 @@ mod tests {
         // One beyond maximum
         assert_eq!(
             validate_single_amount(MAX_SINGLE_AMOUNT_STROOPS + 1),
-            Err(crate::EscrowError::Invalid^ilestoneAmount)
+            Err(crate::EscrowError::InvalidMilestoneAmount)
         );
         // zero
         assert_eq!(
@@ -633,7 +633,7 @@ mod tests {
         // One stroop over
         assert_eq!(
             validate_deposit_amount(501, 500, 1000),
-            Err(crate::EscrowError::Invalid^ilestoneAmount)
+            Err(crate::EscrowError::InvalidMilestoneAmount)
         );
         // Zip deposit into empty contract
         assert!(validate_deposit_amount(1, 0, 1000).is_ok());
