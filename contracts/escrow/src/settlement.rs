@@ -533,6 +533,22 @@ pub fn is_finalized(env: &Env, contract_id: u32) -> bool {
 ///     write_finalization(&env, 5, &record); // panics: AlreadyFinalized
 /// });
 /// ```
+pub(crate) fn commit_finalization(
+    env: &Env,
+    contract_id: u32,
+    record: &FinalizationRecord,
+) -> Result<CommitOutcome, Error> {
+    validate_contract_id(contract_id)?;
+    match read_finalization(env, contract_id) {
+        Some(existing) if existing == *record => Ok(CommitOutcome::Recovered),
+        Some(_) => Err(Error::AlreadyFinalized),
+        None => {
+            write_finalization(env, contract_id, record);
+            Ok(CommitOutcome::Committed)
+        }
+    }
+}
+
 pub fn write_finalization(env: &Env, contract_id: u32, record: &FinalizationRecord) {
     // Invariant: write-once. Reject any attempt to overwrite an existing record.
     // This is the canonical enforcement point.
@@ -659,6 +675,7 @@ pub fn require_not_finalized(env: &Env, contract_id: u32) {
 mod tests {
     use super::*;
     use crate::finalize::FinalizationRecord;
+    use crate::test::assert_contract_error;
     use crate::{
         ContractStatus, ContractSummary, Escrow, EscrowClient, CONTRACT_SUMMARY_SCHEMA_VERSION,
     };

@@ -373,8 +373,12 @@ pub(crate) fn validate_milestone_accounting(
     env: &Env,
     milestone: &crate::Milestone,
 ) {
-    let total = milestone
-        .released_amount
+    let released_amount = if milestone.released {
+        milestone.funded_amount
+    } else {
+        0
+    };
+    let total = released_amount
         .checked_add(milestone.refunded_amount)
         .unwrap_or_else(|| env.panic_with_error(EscrowError::AccountingMismatch));
     if total > milestone.funded_amount {
@@ -493,22 +497,15 @@ pub(crate) fn validate_release_authorization(
     use crate::ReleaseAuthorization;
     let authorized = match contract.release_authorization {
         ReleaseAuthorization::ClientOnly => caller == &contract.client,
-        ReleaseAuthorization::FreelancerOnly => caller == &contract.freelancer,
-        ReleaseAuthorization::ClientOrFreelancer => {
-            caller == &contract.client || caller == &contract.freelancer
+        ReleaseAuthorization::ClientAndArbiter => {
+            caller == &contract.client || contract.arbiter.as_ref().map_or(false, |a| caller == a)
         }
         ReleaseAuthorization::ArbiterOnly => {
             contract.arbiter.as_ref().map_or(false, |a| caller == a)
         }
-        ReleaseAuthorization::ClientOrArbiter => {
-            caller == &contract.client
-                || contract.arbiter.as_ref().map_or(false, |a| caller == a)
+        ReleaseAuthorization::MultiSig => {
+            caller == &contract.client || caller == &contract.freelancer
         }
-        ReleaseAuthorization::FreelancerOrArbiter => {
-            caller == &contract.freelancer
-                || contract.arbiter.as_ref().map_or(false, |a| caller == a)
-        }
-        ReleaseAuthorization::Any => true,
     };
     if !authorized {
         env.panic_with_error(Error::Unauthorized);
@@ -527,7 +524,7 @@ pub(crate) fn validate_release_authorization(
 pub(crate) fn validate_contract_status_consistency(env: &Env, contract: &Contract) {
     use crate::ContractStatus;
     match contract.status {
-        ContractStatus::Created => {
+        ContractStatus::Created | ContractStatus::Accepted => {
             if contract.funded_amount != 0
                 || contract.released_amount != 0
                 || contract.refunded_amount != 0
@@ -535,7 +532,7 @@ pub(crate) fn validate_contract_status_consistency(env: &Env, contract: &Contrac
                 env.panic_with_error(EscrowError::InvalidContractStatus);
             }
         }
-        ContractStatus::Funded => {
+        ContractStatus::Funded | ContractStatus::PartiallyFunded => {
             if contract.funded_amount == 0 {
                 env.panic_with_error(EscrowError::InvalidContractStatus);
             }
@@ -545,7 +542,7 @@ pub(crate) fn validate_contract_status_consistency(env: &Env, contract: &Contrac
                 env.panic_with_error(EscrowError::InvalidContractStatus);
             }
         }
-        ContractStatus::Cancelled => {
+        ContractStatus::Cancelled | ContractStatus::Refunded => {
             if contract.refunded_amount == 0 {
                 env.panic_with_error(EscrowError::InvalidContractStatus);
             }
@@ -695,12 +692,6 @@ pub(crate) fn save_initialized(env: &Env, admin: &crate::Address) {
 /// Callers that pass the result of a prior validated allocation (from
 /// `create_contract`) will never see a zero here in normal operation. This
 /// guard exists to reject malicious or confused client inputs.
-pub(crate) fn validate_contract_id_bounds(env: &Env, contract_id: u32) {
-    if contract_id == 0 {
-        env.panic_with_error(Error::InvalidContractId);
-    }
-}
-
 // ── Contract loading ──────────────────────────────────────────────────────────
 
 /// Load a contract from persistent storage.
@@ -994,7 +985,22 @@ pub(crate) fn consume_admin_nonce(env: &Env, provided_nonce: u64) {
     env.storage()
         .persistent()
         .set(&DataKey::AdminNonce, &expected);
-    true
+}
+
+const MAX_STORAGE_RETRIES: u32 = 3;
+
+fn recover_or_panic<T>(
+    _env: &Env,
+    mut operation: impl FnMut() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut last_error = Error::ContractNotFound;
+    for _ in 0..MAX_STORAGE_RETRIES {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 // ── Finalization guards ───────────────────────────────────────────────────────
@@ -1054,4 +1060,3 @@ pub(crate) fn require_not_finalized(env: &Env, contract_id: u32) -> bool {
 // Registering an `Escrow` from within storage.rs would create a circular
 // module dependency. Moving the tests to the `test/` module, which already
 // imports `Escrow` and `EscrowClient`, resolves this cleanly.
-

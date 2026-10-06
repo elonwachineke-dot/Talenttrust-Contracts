@@ -90,24 +90,6 @@ struct MilestoneSnapshot {
     amount: i128,
 }
 
-/// Read milestone `index` directly from persistent storage without going
-/// through any entrypoint, so we can assert on raw state.
-fn read_milestone(
-    env: &Env,
-    contract_addr: &Address,
-    contract_id: u32,
-    index: u32,
-) -> Milestone {
-    env.as_contract(contract_addr, || {
-        let key = (
-            DataKey::Contract(contract_id),
-            Symbol::new(env, "milestones"),
-        );
-        let milestones: SorobanVec<Milestone> = env.storage().persistent().get(&key).unwrap();
-        milestones.get(index).unwrap()
-    })
-}
-
 /// Capture a snapshot of the milestone at `index`.
 fn snapshot_milestone(
     env: &Env,

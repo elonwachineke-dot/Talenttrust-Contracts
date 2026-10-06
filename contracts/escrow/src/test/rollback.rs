@@ -4,7 +4,7 @@ use crate::rollback::{
     rollback_milestone_count, store_dispute_rollback, validate_rollback_record,
     MAX_ROLLBACK_MILESTONES,
 };
-use soroban_sdk::{restutils::Address as _, Address, Env, Vec};
+use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
 
 /// Helper that builds a minimal contract with the given status.
 fn make_contract(env: &Env, status: ContractStatus) -> Contract {

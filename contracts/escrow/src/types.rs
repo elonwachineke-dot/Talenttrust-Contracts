@@ -226,6 +226,14 @@ pub enum DataKey {
     ContractMutationLock(u32),
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdditionalDataKey {
+    ContractCreationGuard,
+    KeyRecovery(u32),
+    MilestoneRecord(u32, u32),
+}
+
 // ── Two-step Governance Proposal (Issue #1221) ───────────────────────────────
 
 /// Identifies which high-impact parameter the proposal targets.
@@ -443,6 +451,25 @@ pub enum Error {
     /// contract can never produce this error, so it always signals corrupted
     /// or stale on-ledger state discovered before it could be propagated.
     StorageInvariantViolated = 87,
+    ContractCreationInProgress = 88,
+    ExactDepositRequired = 89,
+    InvalidDisputeReason = 90,
+    MilestoneNotFound = 91,
+    InvalidMilestoneIndex = 92,
+    InvalidDeadline = 93,
+    InvalidMilestoneCount = 94,
+    MilestoneAlreadyRefunded = 95,
+    MilestoneOverFunded = 96,
+    MilestoneAlreadyFunded = 97,
+    MilestoneNotFunded = 98,
+    InvalidContractStatus = 99,
+    OutstandingFunds = 100,
+    AccountingMismatch = 101,
+    InvalidParties = 102,
+    ReputationNotIssued = 103,
+    Unauthorized = 104,
+    InvariantViolation = 105,
+    InvalidStateTransition = 106,
 }
 
 // ── Core contract state ──────────────────────────────────────────────────────
