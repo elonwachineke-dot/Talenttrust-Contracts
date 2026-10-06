@@ -67,6 +67,8 @@
 #![allow(unused_doc_comments)]
 #![allow(deprecated)]
 #![allow(mismatched_lifetime_syntaxes)]
+#[cfg(test)]
+extern crate std;
 
 mod amount_validation;
 mod approvals;
@@ -88,9 +90,10 @@ mod milestone_transitions;
 mod milestones;
 pub mod milestones_consts;
 pub mod validation_boundaries;
-mod refund_impl;
+mod refund;
 mod release;
 mod reputation;
+mod reputation_migration;
 mod rollback;
 mod schema_migration;
 mod settlement;
@@ -134,6 +137,11 @@ pub const MIN_MAX_MILESTONES: u32 = 1;
 pub const MIN_MAX_ESCROW_STROOPS: i128 = 1_000_000;
 pub const MIN_MAX_BATCH_SETTLEMENT: u32 = 1;
 pub const MAX_MAX_BATCH_SETTLEMENT: u32 = 100;
+pub const DEFAULT_PROTOCOL_FEE_BPS: u32 = 500;
+pub const MAX_FEE_WITHDRAWAL_CAP_BPS: u32 = 10_000;
+pub const DEFAULT_FEE_WITHDRAWAL_CAP_BPS: u32 = 5_000;
+pub const MAX_FEE_WITHDRAWAL_COOLDOWN_LEDGERS: u32 = 2_592_000;
+pub const DEFAULT_FEE_WITHDRAWAL_COOLDOWN_LEDGERS: u32 = 17_280;
 
 /// Deployment readiness snapshot returned by `get_mainnet_readiness_info`.
 #[soroban_sdk::contracttype]
@@ -152,7 +160,7 @@ pub use dispute::DisputeInfo;
 pub use events::{EventInput, MAX_EVENT_BATCH_SIZE};
 pub use migration::{ContractV1, PendingClientMigration, CONTRACT_STORAGE_SCHEMA_VERSION};
 pub use milestones_consts::PROTOCOL_FEE_BPS_DENOMINATOR;
-pub use proptest::{check_contract_invariants, InvariantViolation};
+pub use keys_recovery::KeyRecoveryRecord;
 pub use token_scale::{normalized_amount, scale_multiplier, MAX_TOKEN_DECIMALS};
 pub use ttl::{
     ADMIN_ROTATION_MIN_DELAY_LEDGERS, ADMIN_ROTATION_PROPOSAL_TTL_LEDGERS,
@@ -162,10 +170,11 @@ pub use types::{
     AuthorizationRecord, Contract, ContractBounds, ContractStatus, ContractSummary, DataKey,
     DepositMode, DisputeConfig, DisputeMetadata, DisputeResolution, DisputeSplit,
     GovernanceProposal, GovernanceProposalKind, GovernanceProposalState, GovernedParameters,
-    Milestone, MilestoneApprovals, MilestoneProgress, MilestoneReleaseReadiness, MilestoneSummary,
+    AdditionalDataKey, Milestone, MilestoneApprovals, MilestoneProgress,
+    MilestoneReleaseReadiness, MilestoneSummary,
     PauseScope, PauseTarget, PendingAdminProposal, ReadinessChecklist, ReleaseAuthorization,
-    Reputation, ReputationConfig, SplitAmounts, CONTRACT_SUMMARY_SCHEMA_VERSION,
-    DISPUTE_STORAGE_VERSION,
+    Reputation, ReputationConfig, SettlementState, SplitAmounts, CONTRACT_SUMMARY_SCHEMA_VERSION,
+    DISPUTE_STORAGE_VERSION, REPUTATION_STORAGE_VERSION,
 };
 
 // Maximum bounds constants - re-export from amount_validation for API visibility
@@ -246,10 +255,154 @@ impl Escrow {
     pub(crate) fn end_contract_creation(env: &Env) {
         create_contract_guard::end(env)
     }
+
 }
 
 #[contractimpl]
 impl Escrow {
+    /// Creates a new escrow contract with the specified client, freelancer, and milestone amounts.
+    ///
+    /// This is the single canonical creation path. It enforces:
+    /// - Distinct client and freelancer addresses
+    /// - Arbiter presence when required by the release authorization mode
+    /// - Arbiter distinctness from client and freelancer
+    /// - At least one milestone with all amounts strictly positive
+    /// - The configurable max-milestones cap (defaults to `MAX_MILESTONES`,
+    ///   bounded above by `MAX_MAX_MILESTONES`)
+    /// - The governed total-escrow cap combined with the configurable
+    ///   max-escrow-stroops cap (the min of the two is enforced; falls back
+    ///   to `i128::MAX` when neither is set)
+    /// - No contract-id collision or overflow
+    pub fn create_contract(
+        env: Env,
+        client: Address,
+        freelancer: Address,
+        arbiter: Option<Address>,
+        milestones: Vec<i128>,
+        release_authorization: ReleaseAuthorization,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        client.require_auth();
+
+        if client == freelancer {
+            env.panic_with_error(EscrowError::InvalidParticipant);
+        }
+
+        match release_authorization {
+            ReleaseAuthorization::ArbiterOnly | ReleaseAuthorization::ClientAndArbiter
+                if arbiter.is_none() =>
+            {
+                env.panic_with_error(EscrowError::MissingArbiter);
+            }
+            _ => {}
+        }
+
+        if let Some(ref a) = arbiter {
+            if a == &client || a == &freelancer {
+                env.panic_with_error(EscrowError::InvalidArbiter);
+            }
+        }
+
+        if milestones.is_empty() {
+            env.panic_with_error(EscrowError::EmptyMilestones);
+        }
+
+        if milestones.len() > MAX_MAX_MILESTONES {
+            env.panic_with_error(EscrowError::TooManyMilestones);
+        }
+
+        let max_milestones = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::MaxMilestones)
+            .unwrap_or(crate::MAX_MILESTONES);
+        if milestones.len() > max_milestones {
+            env.panic_with_error(EscrowError::TooManyMilestones);
+        }
+
+        if max_milestones < MIN_MAX_MILESTONES || max_milestones > MAX_MAX_MILESTONES {
+            env.panic_with_error(EscrowError::TooManyMilestones);
+        }
+
+        let max_total = {
+            let governed = env
+                .storage()
+                .persistent()
+                .get::<_, GovernedParameters>(&DataKey::GovernedParameters)
+                .map(|params| params.max_escrow_total_stroops)
+                .unwrap_or(i128::MAX);
+            let configurable = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::MaxEscrowStroops)
+                .unwrap_or(crate::DEFAULT_MAX_TOTAL_ESCROW_STROOPS);
+            governed.min(configurable)
+        };
+
+        let mut native_milestones = [0_i128; crate::MAX_MAX_MILESTONES as usize];
+        let len = milestones.len() as usize;
+        for i in 0..len {
+            let v = milestones.get(i as u32).unwrap();
+            if v <= 0 {
+                env.panic_with_error(EscrowError::InvalidMilestoneAmount);
+            }
+            native_milestones[i] = v;
+        }
+
+        if len == 0 || len > MAX_MAX_MILESTONES as usize {
+            env.panic_with_error(EscrowError::TooManyMilestones);
+        }
+
+        match amount_validation::validate_milestone_amounts(&native_milestones[..len], max_total) {
+            Ok(_) => {}
+            Err(e) => env.panic_with_error(e),
+        }
+
+        if let Some(decimals) = token_scale::read_token_scale(&env) {
+            token_scale::require_all_exact_scale(&env, native_milestones[..len].iter(), decimals);
+        }
+
+        let contract = Contract {
+            client: client.clone(),
+            freelancer: freelancer.clone(),
+            arbiter,
+            status: ContractStatus::Created,
+            total_deposited: 0,
+            funded_amount: 0,
+            released_amount: 0,
+            refunded_amount: 0,
+            release_authorization,
+            reputation_issued: false,
+        };
+
+        ttl::extend_next_contract_id_ttl(&env);
+        let id = Self::reserve_contract_id(&env);
+
+        env.storage().persistent().set(&DataKey::Contract(id), &contract);
+
+        let milestone_key = keys::milestone_key(&env, id);
+        let mut milestone_vec: Vec<Milestone> = Vec::new(&env);
+        for i in 0..len {
+            let amount = native_milestones[i];
+            milestone_vec.push_back(Milestone {
+                amount,
+                funded_amount: 0,
+                released: false,
+                refunded: false,
+                work_evidence: None,
+                refunded_amount: 0,
+                deadline: None,
+            });
+        }
+        env.storage().persistent().set(&milestone_key, &milestone_vec);
+
+        env.events().publish(
+            (symbol_short!("created"), id),
+            (client, freelancer.clone(), env.ledger().timestamp()),
+        );
+
+        id
+    }
     // Bind the single Stellar Asset Contract (SAC) token this escrow instance will custody.
     //
     // This is a **write-once** step: once a token is recorded under
@@ -391,7 +544,7 @@ impl Escrow {
     // deterministic and observable:
     //
     // * `begin_key_recovery` records the intent to repair a specific
-    //   `contract_id` under a dedicated `DataKey::KeyRecovery(contract_id)`
+    //   `contract_id` under a dedicated `AdditionalDataKey::KeyRecovery(contract_id)`
     //   key.  It is idempotent: calling it twice for the same contract is a
     //   no-op that returns the existing record.
     // * `complete_key_recovery` marks the record as `Recovered` and clears
@@ -425,7 +578,7 @@ impl Escrow {
         if env
             .storage()
             .persistent()
-            .has(&DataKey::KeyRecovery(contract_id))
+            .has(&AdditionalDataKey::KeyRecovery(contract_id))
         {
             return true;
         }
@@ -537,7 +690,8 @@ impl Escrow {
         contract_id: u32,
         current_client: Address,
     ) -> bool {
-        Self::cancel_client_migration_impl(&env, contract_id, current_client)
+        Self::require_not_paused(&env);
+        Self::cancel_client_migration_inner(&env, contract_id, current_client)
     }
 
     pub fn has_pending_client_migration(env: Env, contract_id: u32) -> bool {
@@ -548,27 +702,6 @@ impl Escrow {
         Self::require_initialized(&env);
         Self::get_pending_client_migration_impl(&env, contract_id)
     }
-
-    /// Cancel a live pending client migration.
-    ///
-    /// The current client must authorize the call. A live pending migration must
-    /// exist for the given `contract_id`. The pending migration entry is removed
-    /// and a `client_migration_cancelled` event is emitted.
-    ///
-    /// # Errors
-    /// * [`EscrowError::ContractNotFound`] — `contract_id == 0` or contract does not exist.
-    /// * [`EscrowError::UnauthorizedRole`] — `current_client` is not the contract's client.
-    /// * [`EscrowError::InvalidState`] — no live pending migration exists.
-    /// * [`Error::ContractPaused`] — contract is paused.
-    pub fn cancel_client_migration(
-        env: Env,
-        contract_id: u32,
-        current_client: Address,
-    ) -> bool {
-        Self::require_not_paused(&env);
-        Self::cancel_client_migration_inner(&env, contract_id, current_client)
-    }
-
 
     // â”€â”€ Milestone Releases & Refunds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -954,7 +1087,7 @@ impl Escrow {
         if all_released {
             env.events().publish(
                 (symbol_short!("ctrct_cmp"), contract_id),
-                (caller, env.ledger().timestamp()),
+                (caller.clone(), env.ledger().timestamp()),
             );
         }
 
@@ -1226,7 +1359,7 @@ impl Escrow {
         if all_released {
             env.events().publish(
                 (symbol_short!("ctrct_cmp"), contract_id),
-                (caller, env.ledger().timestamp()),
+                (caller.clone(), env.ledger().timestamp()),
             );
         }
 
@@ -2265,7 +2398,7 @@ impl Escrow {
         contract_id: u32,
         milestone_index: u32,
     ) -> Option<MilestoneApprovals> {
-        let approval_key = keys::milestone_approval_key(&env, contract_id, milestone_index);
+        let approval_key = keys::milestone_approval_key(contract_id, milestone_index);
         let approvals = env.storage().temporary().get(&approval_key);
         if approvals.is_some() {
             env.storage().temporary().extend_ttl(
@@ -3296,19 +3429,7 @@ impl Escrow {
         }
         caller.require_auth();
 
-        // Deterministic pre-validation pass: verify every item is well-formed
-        // before emitting anything. This guarantees all-or-nothing semantics
-        // for the batch — a malformed item at index N cannot leave items
-        // [0, N) already emitted with no way to recover or reconcile.
         let batch_len = events.len();
-        for i in 0..batch_len {
-            let item = events.get(i).unwrap();
-            // Topic and data must be non-empty symbols to be indexable.
-            if item.topic.len() == 0 {
-                env.panic_with_error(Error::InvalidProtocolParameters);
-            }
-        }
-
         let mut count: u32 = 0;
         for i in 0..batch_len {
             let item = events.get(i).unwrap();
@@ -3351,6 +3472,389 @@ impl Escrow {
         caller.require_auth();
         env.events().publish((topic, contract_id), data);
         true
+    }
+
+    // -----------------------------------------------------------------------
+    // Compatibility wrappers for legacy governance / proposal APIs expected by
+    // older tests and generated clients.
+    // -----------------------------------------------------------------------
+
+    pub fn set_protocol_fee_bps(env: Env, new_bps: u32) -> bool {
+        Self::require_initialized(&env);
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.panic_with_error(EscrowError::NotInitialized));
+        admin.require_auth();
+        storage_validation::validate_protocol_fee_bps(&env, new_bps);
+        if new_bps > MAX_FEE_BPS {
+            env.panic_with_error(EscrowError::InvalidProtocolParameters);
+        }
+
+        let old_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(DEFAULT_PROTOCOL_FEE_BPS);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProtocolFeeBps, &new_bps);
+        env.events().publish(
+            (Symbol::new(&env, "protocol_fee_bps"),),
+            (old_bps, new_bps, admin.clone(), env.ledger().timestamp()),
+        );
+        true
+    }
+
+    pub fn get_protocol_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ProtocolFeeBps)
+            .unwrap_or(DEFAULT_PROTOCOL_FEE_BPS)
+    }
+
+    pub fn set_max_milestones(env: Env, max_milestones: u32) -> bool {
+        Self::require_initialized(&env);
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.panic_with_error(EscrowError::NotInitialized));
+        admin.require_auth();
+
+        if max_milestones < MIN_MAX_MILESTONES || max_milestones > MAX_MAX_MILESTONES {
+            env.panic_with_error(EscrowError::LimitOutOfRange);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxMilestones, &max_milestones);
+        true
+    }
+
+    pub fn get_max_milestones(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::MaxMilestones)
+            .unwrap_or(crate::MAX_MILESTONES)
+    }
+
+    pub fn set_governed_params(
+        env: Env,
+        admin: Address,
+        protocol_fee_bps: u32,
+        max_escrow_total_stroops: i128,
+    ) -> bool {
+        let new_parameters = GovernedParameters {
+            protocol_fee_bps,
+            max_escrow_total_stroops,
+        };
+        Self::set_governed_parameters(env, admin, new_parameters)
+    }
+
+    pub fn set_governed_parameters(
+        env: Env,
+        admin: Address,
+        new_parameters: GovernedParameters,
+    ) -> bool {
+        Self::require_initialized(&env);
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.panic_with_error(EscrowError::NotInitialized));
+
+        if admin != stored_admin {
+            env.panic_with_error(EscrowError::UnauthorizedRole);
+        }
+        admin.require_auth();
+
+        if new_parameters.protocol_fee_bps > MAX_FEE_BPS {
+            env.panic_with_error(EscrowError::InvalidProtocolParameters);
+        }
+
+        storage_validation::validate_escrow_total_cap(
+            &env,
+            new_parameters.max_escrow_total_stroops,
+        );
+        if new_parameters.max_escrow_total_stroops <= 0 {
+            env.panic_with_error(EscrowError::InvalidProtocolParameters);
+        }
+
+        let old_parameters: Option<GovernedParameters> =
+            env.storage().persistent().get(&DataKey::GovernedParameters);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovernedParameters, &new_parameters);
+
+        ttl::extend_governed_parameters_ttl(&env);
+
+        let mut checklist: ReadinessChecklist = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReadinessChecklist)
+            .unwrap_or_default();
+        checklist.governed_params_set = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReadinessChecklist, &checklist);
+
+        env.events().publish(
+            (Symbol::new(&env, "governed_parameters"),),
+            (
+                old_parameters,
+                new_parameters,
+                admin,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        true
+    }
+
+    pub fn get_governed_parameters(env: Env) -> Option<GovernedParameters> {
+        let params: Option<GovernedParameters> =
+            env.storage().persistent().get(&DataKey::GovernedParameters);
+        if params.is_some() {
+            ttl::extend_governed_parameters_ttl(&env);
+        }
+        params
+    }
+
+    pub fn request_governance_proposal(env: Env, kind: GovernanceProposalKind) -> u64 {
+        Self::require_initialized(&env);
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.panic_with_error(EscrowError::NotInitialized));
+        admin.require_auth();
+
+        crate::governance_proposal::validate_kind(&env, &kind);
+
+        let proposal_id = crate::governance_proposal::next_proposal_id(&env);
+        let proposed_at = env.ledger().sequence();
+        let expires_at = proposed_at.saturating_add(crate::ttl::GOVERNANCE_PROPOSAL_TTL_LEDGERS);
+
+        let proposal = GovernanceProposal {
+            proposal_id,
+            requester: admin.clone(),
+            state: GovernanceProposalState::Pending,
+            kind: kind.clone(),
+            proposed_at_ledger: proposed_at,
+            expires_at_ledger: expires_at,
+            approver: None,
+        };
+
+        crate::governance_proposal::save_proposal(&env, &proposal);
+
+        env.events().publish(
+            (symbol_short!("gov"), Symbol::new(&env, "requested")),
+            (
+                proposal_id,
+                admin,
+                kind,
+                expires_at,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        proposal_id
+    }
+
+    pub fn approve_governance_proposal(env: Env, proposal_id: u64, approver: Address) -> bool {
+        approver.require_auth();
+
+        let mut proposal = crate::governance_proposal::load_proposal(&env, proposal_id);
+        crate::governance_proposal::require_not_expired(&env, &proposal);
+        crate::governance_proposal::require_state(
+            &env,
+            &proposal,
+            GovernanceProposalState::Pending,
+        );
+
+        if approver == proposal.requester {
+            env.panic_with_error(EscrowError::GovernanceSelfApproval);
+        }
+
+        proposal.state = GovernanceProposalState::Approved;
+        proposal.approver = Some(approver.clone());
+        crate::governance_proposal::save_proposal(&env, &proposal);
+
+        env.events().publish(
+            (symbol_short!("gov"), Symbol::new(&env, "approved")),
+            (proposal_id, approver, env.ledger().timestamp()),
+        );
+
+        true
+    }
+
+    pub fn reject_governance_proposal(env: Env, proposal_id: u64, approver: Address) -> bool {
+        approver.require_auth();
+
+        let mut proposal = crate::governance_proposal::load_proposal(&env, proposal_id);
+        crate::governance_proposal::require_not_expired(&env, &proposal);
+        crate::governance_proposal::require_state(
+            &env,
+            &proposal,
+            GovernanceProposalState::Pending,
+        );
+
+        if approver == proposal.requester {
+            env.panic_with_error(EscrowError::GovernanceSelfApproval);
+        }
+
+        proposal.state = GovernanceProposalState::Rejected;
+        proposal.approver = Some(approver.clone());
+        crate::governance_proposal::save_proposal(&env, &proposal);
+
+        env.events().publish(
+            (symbol_short!("gov"), Symbol::new(&env, "rejected")),
+            (proposal_id, approver, env.ledger().timestamp()),
+        );
+
+        true
+    }
+
+    pub fn apply_governance_proposal(env: Env, proposal_id: u64) -> bool {
+        Self::require_initialized(&env);
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.panic_with_error(EscrowError::NotInitialized));
+        admin.require_auth();
+
+        let mut proposal = crate::governance_proposal::load_proposal(&env, proposal_id);
+        crate::governance_proposal::require_not_expired(&env, &proposal);
+        crate::governance_proposal::require_state(
+            &env,
+            &proposal,
+            GovernanceProposalState::Approved,
+        );
+
+        crate::governance_proposal::apply_kind(&env, &proposal.kind);
+
+        proposal.state = GovernanceProposalState::Applied;
+        crate::governance_proposal::save_proposal(&env, &proposal);
+
+        env.events().publish(
+            (symbol_short!("gov"), Symbol::new(&env, "applied")),
+            (proposal_id, admin, proposal.kind.clone(), env.ledger().timestamp()),
+        );
+
+        true
+    }
+
+    pub fn get_governance_proposal(env: Env, proposal_id: u64) -> Option<GovernanceProposal> {
+        let proposal: Option<GovernanceProposal> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovernanceProposal(proposal_id));
+        if let Some(ref p) = proposal {
+            if env.ledger().sequence() > p.expires_at_ledger {
+                return Some(p.clone());
+            }
+        }
+        proposal
+    }
+
+    pub fn get_next_governance_proposal_id(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::NextGovernanceProposalId)
+            .unwrap_or(0u64)
+    }
+
+    pub fn set_fee_withdrawal_cap(env: Env, cap_bps: u32) -> bool {
+        Self::require_initialized(&env);
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.panic_with_error(EscrowError::NotInitialized));
+        admin.require_auth();
+
+        if cap_bps > MAX_FEE_WITHDRAWAL_CAP_BPS {
+            env.panic_with_error(EscrowError::InvalidProtocolParameters);
+        }
+
+        let old_cap: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeWithdrawalCap)
+            .unwrap_or(DEFAULT_FEE_WITHDRAWAL_CAP_BPS);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeWithdrawalCap, &cap_bps);
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_cap"),),
+            (old_cap, cap_bps, admin.clone(), env.ledger().timestamp()),
+        );
+        true
+    }
+
+    pub fn get_fee_withdrawal_cap(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeWithdrawalCap)
+            .unwrap_or(DEFAULT_FEE_WITHDRAWAL_CAP_BPS)
+    }
+
+    pub fn set_fee_withdrawal_cooldown(env: Env, cooldown_ledgers: u32) -> bool {
+        Self::require_initialized(&env);
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.panic_with_error(EscrowError::NotInitialized));
+        admin.require_auth();
+
+        if cooldown_ledgers > MAX_FEE_WITHDRAWAL_COOLDOWN_LEDGERS {
+            env.panic_with_error(EscrowError::InvalidProtocolParameters);
+        }
+
+        let old_cooldown: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeWithdrawalCooldownLedgers)
+            .unwrap_or(DEFAULT_FEE_WITHDRAWAL_COOLDOWN_LEDGERS);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeWithdrawalCooldownLedgers, &cooldown_ledgers);
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_cooldown"),),
+            (
+                old_cooldown,
+                cooldown_ledgers,
+                admin.clone(),
+                env.ledger().timestamp(),
+            ),
+        );
+        true
+    }
+
+    pub fn get_fee_withdrawal_cooldown(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeWithdrawalCooldownLedgers)
+            .unwrap_or(DEFAULT_FEE_WITHDRAWAL_COOLDOWN_LEDGERS)
+    }
+
+    pub fn get_last_fee_withdrawal_ledger(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LastFeeWithdrawalLedger)
+            .unwrap_or(0u32)
     }
 
     // -----------------------------------------------------------------------
@@ -3951,20 +4455,6 @@ impl Escrow {
     /// Read the current on-ledger storage schema version for the escrow contract.
     pub fn get_schema_version(env: Env) -> u32 {
         Self::get_schema_version_impl(&env)
-    }
-
-    /// Read-only invariant probe used by property tests and off-chain monitors.
-    ///
-    /// Returns `Ok(())` when the contract's accounting state satisfies the
-    /// custody invariant `released_amount + refunded_amount +
-    /// accumulated_protocol_fees <= funded_amount`, and every milestone's
-    /// `released`/`refunded` flags are mutually exclusive. Returns
-    /// `Err(InvariantViolation)` describing the first violation otherwise.
-    ///
-    /// This entrypoint performs no mutation and does not extend TTLs, so it is
-    /// safe to call from property-test harnesses and monitoring jobs.
-    pub fn check_invariants(env: Env, contract_id: u32) -> Result<(), InvariantViolation> {
-        proptest::check_contract_invariants(&env, contract_id)
     }
 
     /// Upgrade storage schema to `target_version` with admin authorization and events.

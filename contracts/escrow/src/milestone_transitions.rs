@@ -1,4 +1,5 @@
-use crate::{DataKey, Error, Milestone};
+use crate::types::{AdditionalDataKey, DataKey};
+use crate::{Error, Milestone};
 use soroban_sdk::{Address, BytesN, Env};
 
 /// Represents the logical state of a milestone based on its `released` and `refunded` flags.
@@ -247,7 +248,7 @@ pub fn apply_milestone_transition(
     check_version_for_concurrency(env, contract_id, milestone_index, expected_version)?;
 
     // 2. Load the milestone and derive its current state.
-    let key = DataKey::Milestone(contract_id, milestone_index);
+    let key = AdditionalDataKey::MilestoneRecord(contract_id, milestone_index);
     let mut milestone: Milestone = env
         .storage()
         .persistent()
@@ -566,7 +567,7 @@ mod tests {
     fn store_milestone(env: &Env, contract_id: u32, index: u32, milestone: &Milestone) {
         env.storage()
             .persistent()
-            .set(&DataKey::Milestone(contract_id, index), milestone);
+            .set(&AdditionalDataKey::MilestoneRecord(contract_id, index), milestone);
     }
 
     #[test]
@@ -591,7 +592,7 @@ mod tests {
         let stored: Milestone = env
             .storage()
             .persistent()
-            .get(&DataKey::Milestone(contract_id, index))
+            .get(&AdditionalDataKey::MilestoneRecord(contract_id, index))
             .unwrap();
         assert!(stored.released);
         assert!(!stored.refunded);
@@ -619,7 +620,7 @@ mod tests {
         let stored: Milestone = env
             .storage()
             .persistent()
-            .get(&DataKey::Milestone(contract_id, index))
+            .get(&AdditionalDataKey::MilestoneRecord(contract_id, index))
             .unwrap();
         assert!(!stored.released);
         assert!(stored.refunded);
@@ -660,7 +661,7 @@ mod tests {
         let stored: Milestone = env
             .storage()
             .persistent()
-            .get(&DataKey::Milestone(contract_id, index))
+            .get(&AdditionalDataKey::MilestoneRecord(contract_id, index))
             .unwrap();
         assert!(stored.released);
         assert!(!stored.refunded);

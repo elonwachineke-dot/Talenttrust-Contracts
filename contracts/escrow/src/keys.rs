@@ -45,7 +45,6 @@ use crate::milestones_consts::MAX_MILESTONES;
 use crate::types::{DataKey, Error};
 use soroban_sdk::{Env, Symbol};
 
-use crate::types::DataKey;
 use crate::EscrowError;
 
 // ── Key constructors ─────────────────────────────────────────────────────────

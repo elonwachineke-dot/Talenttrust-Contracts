@@ -84,6 +84,24 @@ pub const REPUTATION_CREDIT_INCREMENT: i128 = 1;
 /// acts as a business limit.
 pub const MAX_PENDING_REPUTATION_CREDITS: i128 = 1_000_000;
 
+pub(crate) fn accrue_pending_credit(pending: i128) -> Option<i128> {
+    if pending < 0 || pending >= MAX_PENDING_REPUTATION_CREDITS {
+        return None;
+    }
+    pending.checked_add(REPUTATION_CREDIT_INCREMENT)
+}
+
+pub(crate) fn is_valid_pending_credit_ledger(value: i128) -> bool {
+    value >= 0 && value <= MAX_PENDING_REPUTATION_CREDITS
+}
+
+pub(crate) fn consume_pending_credit(pending: i128) -> Option<i128> {
+    if pending <= 0 || pending > MAX_PENDING_REPUTATION_CREDITS {
+        return None;
+    }
+    pending.checked_sub(REPUTATION_CREDIT_INCREMENT)
+}
+
 /// Basis-point scaling factor for `get_average_rating` (×10_000 preserves four decimal places).
 ///
 /// # Invariant

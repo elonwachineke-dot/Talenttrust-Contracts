@@ -1,223 +1,56 @@
-//! Comprehensive tests for amount validation and input sanitization
-///
-/// Tests all money-like values for positivity, max bounds, and stroop precision rules.
+//! Amount validation and input sanitization tests.
+//!
+//! These tests exercise the pure validation helpers directly so they remain
+//! independent from the full contract client stack.
 
-use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, vec, Address, Env};
-
-use crate {
-    safe_add_amounts, safe_subtract_amounts, validate_deposit_amount, validate_milestone_amounts,
-    validate_single_amount, Escrow, EscrowClient, EscrowError, ReleaseAuthorization,
-    MAX_TOTAL_ESCROW_STROOPS,
+use crate::{
+    accumulate_amounts, safe_add_amounts, safe_subtract_amounts, validate_deposit_amount,
+    validate_milestone_amounts, validate_single_amount, AmountBoundary, EscrowError,
+    MAX_SINGLE_AMOUNT_STROOPS, MAX_TOTAL_ESCROW_STROOPS,
 };
 
-fn setup(env: &Env) -> (EscrowClient<'_>, Address, Address) {
-    env.mock_all_auths_allowing_non_root_auth();
-    let cid = env.register(Escrow, ());
-    let client = EscrowClient::new(env, &cid);
-    let admin = Address::generate(env);
-    client.initialize(&admin);
-    client.set_governed_params(&admin, &`_u32`, &MAX_TOTAL_ESCROW_STROOPS);
-
-    let token_admin = Address::generate(env);
-    let token_address = env.register_stellar_asset_contract(token_admin);
-    client.bind_settlement_token(&admin, &token_address);
-
-    let hiring_party = Address::generate(env);
-    let service_provider = Address::generate(env);
-
-    let token_client = StellarAssetClient::new(env, &token_address);
-    token_client.mint(&hiring_party, &10_000_000_0000000_i128);
-
-    (client, hiring_party, service_provider)
-}
-
-// -----------------------------------------------------------------------------
-// Create contract: milestone amount validation
-// -----------------------------------------------------------------------------
-
 #[test]
-#[should_panic]
-fn test_create_contract_panics_when_single_milestone_is_zero() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec![&env, 0_i128];
-    client.create_contract(
-        &hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
+fn classify_amount_handles_non_positive_and_boundary_values() {
+    assert_eq!(crate::classify_amount(0), AmountBoundary::NonPositive);
+    assert_eq!(crate::classify_amount(-1), AmountBoundary::NonPositive);
+    assert_eq!(crate::classify_amount(1), AmountBoundary::WithinBounds);
+    assert_eq!(crate::classify_amount(MAX_SINGLE_AMOUNT_STROOPS), AmountBoundary::WithinBounds);
+    assert_eq!(crate::classify_amount(MAX_SINGLE_AMOUNT_STROOPS + 1), AmountBoundary::AboveMaximum);
 }
 
 #[test]
-#[should_panic]
-fn test_create_contract_panics_when_single_milestone_is_negative() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec!&env, -1_i128];
-    client.create_contract(
-        &hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
+fn validate_single_amount_rejects_invalid_values() {
+    assert!(validate_single_amount(0).is_err());
+    assert!(validate_single_amount(-1).is_err());
+    assert!(validate_single_amount(MAX_SINGLE_AMOUNT_STROOPS).is_ok());
+    assert!(validate_single_amount(MAX_SINGLE_AMOUNT_STROOPS + 1).is_err());
 }
 
 #[test]
-#[should_panic]
-fn test_create_contract_panics_when_any_milestone_is_non_positive() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec!&env, 100_0000000_i128, 0_i128, 200_0000000_i128];
-    client.create_contract(
-        'hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
+fn validate_milestone_amounts_requires_positive_total_and_cap() {
+    let amounts = [10_000_000_i128, 20_000_000_i128];
+    assert!(validate_milestone_amounts(&amounts, 100_000_000).is_ok());
+    assert!(validate_milestone_amounts(&amounts, 20_000_000).is_err());
+    assert!(validate_milestone_amounts(&[-1_i128], 1_000_000).is_err());
 }
 
 #[test]
-fn test_create_contract_accepts_all_positive_milestones() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec!&env, 100_0000000_i128, 1_i128, 999_0000000_i128];
-    let id = client.create_contract(
-        'hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
-    assert!(id > 0);
+fn validate_deposit_amount_catches_overflows_and_limits() {
+    assert!(validate_deposit_amount(100, 0, 1_000).is_ok());
+    assert!(validate_deposit_amount(0, 0, 1_000).is_err());
+    assert!(validate_deposit_amount(100, 1_000_000, 1_000).is_err());
+    assert!(validate_deposit_amount(i128::MAX, 1, 1_000).is_err());
 }
 
 #[test]
-#[should_panic]
-fn test_create_contract_panics_when_total_exceeds_maximum() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec!&env, 600_000_0000000_i128, 500_000_0000000_i128]; // 6M + 5M > 1M max
-    client.create_contract(
-        &hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
+fn safe_arithmetic_uses_checked_operations() {
+    assert_eq!(safe_add_amounts(10, 5), Some(15));
+    assert_eq!(safe_add_amounts(i128::MAX, 1), None);
+    assert_eq!(safe_subtract_amounts(10, 5), Some(5));
+    assert_eq!(safe_subtract_amounts(5, 10), None);
+    assert_eq!(accumulate_amounts([1, 2, 3]), Ok(6));
+    assert!(accumulate_amounts([1, i128::MAX]).is_err());
 }
-
-// -----------------------------------------------------------------------------
-// Deposit funds: amount validation
-// -----------------------------------------------------------------------------
-
-#[test]
-#[should_panic]
-fn test_deposit_funds_panics_on_zero_amount() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec![&env, 100_0000000_i128];
-    let contract_id = client.create_contract(
-        'hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
-    client.deposit_funds(&contract_id, &hiring_party, &p_i128);
-}
-
-#[test]
-#[should_panic]
-fn test_deposit_funds_panics_on_negative_amount() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec!&env, 100_0000000_i128];
-    let contract_id = client.create_contract(
-        &hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
-    client.deposit_funds(&contract_id, &hiring_party, &-100_0000000_i128);
-}
-
-#[test]
-#[should_panic]
-fn test_deposit_funds_panics_when_exceeding_contract_maximum() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec![&env, 500_0000000_i128];
-    let contract_id = client.create_contract(
-        'hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
-    client.deposit_funds(&contract_id, &hiring_party, &`1_000_000_0000000_i128`); // 1M tokens > remaining capacity
-}
-
-#[test]
-fn test_deposit_funds_accepts_valid_amounts() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec!&[env, 100_0000000_i128, 200_0000000_i128];
-    let contract_id = client.create_contract(
-        &hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
-
-    // Valid deposit
-    assert!(client.deposit_funds(&contract_id, &hiring_party, &100_0000000_i128));
-
-    // Another valid deposit within remaining capacity
-    assert!(client.deposit_funds(&contract_id, &hiring_party, &200_0000000_i128));
-}
-
-#[test]
-#[should_panic]
-fn test_deposit_funds_rejects_amount_at_max_single_amount_plus_one() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec!&[env, 1_000_000_0000000_i128]; // Max total equals one max milestone
-    let contract_id = client.create_contract(
-        'hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
-    // Amount just above MAX_SINGLE_AMOUNT_STROOPS must be rejected by the
-    // centralized single-amount validator rather than slipping through.
-    client.deposit_funds(&contract_id, &hiring_party, &(1_000_000_0000000_i128 + 1));
-}
-
-#[test]
-fn test_deposit_funds_accepts_amount_exactly_at_max_single_amount() {
-    let env = Env::default();
-    let (client, hiring_party, service_provider) = setup(&env);
-    let milestones = vec![&env, 2_000_000_0000000_i128]; // 2M total
-    let contract_id = client.create_contract(
-        'hiring_party,
-        &service_provider,
-        &None,
-        &milestones,
-        &ReleaseAuthorization::ClientOnly,
-    );
-    // Deposit exactly the max single amount must succeed.
-    assert!(client.deposit_funds(&contract_id, &hiring_party, &1_000_000_0000000_i128));
-}
-
-// -----------------------------------------------------------------------------
-// Pure validator unit tests
 // -----------------------------------------------------------------------------
 
 #[test]

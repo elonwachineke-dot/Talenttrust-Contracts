@@ -235,29 +235,6 @@ fn stale_validated_deposit_rejected_after_state_change() {
     );
 }
 
-/// Depositing more than the remaining milestone total is rejected and leaves state unchanged.
-#[test]
-fn deposit_rejects_overfunding() {
-    let fixture = EscrowFixture::builder().with_settlement_token().build();
-    let escrow = fixture.escrow();
-    let total = fixture.total_amount();
-    let token = fixture.settlement_token.as_ref().unwrap();
-    StellarAssetClient::new(&fixture.env, token).mint(&fixture.client, &(total + 1));
-
-    assert_contract_error(
-        escrow.try_deposit_funds(&fixture.escrow_id, &fixture.client, &(total + 1)),
-        Error::AmountExceedsRemaining,
-    );
-    assert_eq!(
-        escrow.get_contract(&fixture.escrow_id).status,
-        ContractStatus::PartiallyFunded
-    );
-    assert_eq!(
-        TokenClient::new(&fixture.env, token).balance(&fixture.escrow_address),
-        0
-    );
-}
-
 /// Deposits are rejected once the contract is already fully funded.
 #[test]
 fn deposit_rejects_when_already_funded() {

@@ -28,6 +28,13 @@ pub enum AmountValidationError {
     ExceedsContractMaximum,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AmountBoundary {
+    NonPositive,
+    WithinBounds,
+    AboveMaximum,
+}
+
 /// Classify `amount` against the single-amount boundary.
 ///
 /// The mapping is total and deterministic over the whole `i128` domain,
@@ -68,6 +75,28 @@ pub fn validate_single_amount(amount: i128) -> Result<(), crate::EscrowError> {
     // In Stellar, stroop is the smallest unit, so any integer is valid
     // This check is more for documentation and future-proofing
 
+    Ok(())
+}
+
+pub(crate) fn validate_stroop_amount_value(
+    amount: i128,
+) -> Result<(), crate::EscrowError> {
+    validate_single_amount(amount)
+}
+
+pub(crate) fn validate_accounting_invariant(
+    funded_amount: i128,
+    released_amount: i128,
+    refunded_amount: i128,
+    accumulated_fees: i128,
+) -> Result<(), crate::EscrowError> {
+    let committed = released_amount
+        .checked_add(refunded_amount)
+        .and_then(|value| value.checked_add(accumulated_fees))
+        .ok_or(crate::EscrowError::PotentialOverflow)?;
+    if funded_amount < 0 || committed > funded_amount {
+        return Err(crate::EscrowError::AccountingInvariantViolated);
+    }
     Ok(())
 }
 
@@ -158,7 +187,7 @@ pub fn validate_milestone_amounts(
 /// contract cap, and any arithmetic that would overflow `i128`.
 ///
 /// # Decision Boundaries
-+//
+///
 /// This function operates at three critical boundaries:
 /// - **Exactly-remaining**: `deposit + current == max_total` ℒ Success
 /// - **One stroop short**: `deposit + current == max_total - 1` → Success
@@ -542,16 +571,16 @@ mod tests {
 
     #[test]
     fn test_accumulate_amounts() {
-        let amounts = vec![100_0000000, 200_0000000, 300_0000000];
+        let amounts = [100_0000000_i128, 200_0000000, 300_0000000];
         assert_eq!(accumulate_amounts(amounts), Ok(600_0000000));
 
-        let invalid = vec![100_0000000, 0, 300_0000000];
+        let invalid = [100_0000000_i128, 0, 300_0000000];
         assert_eq!(
             accumulate_amounts(invalid),
             Err(crate::EscrowError::AmountMustBePositive)
         );
 
-        let overflow = vec![i128::MAX - 1, 2, 1];
+        let overflow = [i128::MAX - 1, 2, 1];
         assert_eq!(
             accumulate_amounts(overflow),
             Err(crate::EscrowError::PotentialOverflow)
@@ -595,7 +624,7 @@ mod tests {
     fn test_empty_array() {
         // Empty array is valid and yields zero total.
         assert_eq!(validate_amount_array(&[]), Ok(0));
-        assert_eq!(accumulate_amounts(empty::into_iter::<i128>()), Ok(0));
+        assert_eq!(accumulate_amounts(std::iter::empty::<i128>()), Ok(0));
     }
 
     #[test]
@@ -661,10 +690,10 @@ mod tests {
     #[test]
     fn test_accumulate_amounts_boundaries() {
         // Accumulation exactly at i128::MAX
-        let amounts = vec![i128::MAX - 1, 1];
+        let amounts = [i128::MAX - 1, 1];
         assert_eq!(accumulate_amounts(amounts), Ok(i128::MAX));
         // Accumulation one over i128::MAX
-        let overflow = vec![i128::MAX - 1, 1, 1];
+        let overflow = [i128::MAX - 1, 1, 1];
         assert_eq!(
             accumulate_amounts(overflow),
             Err(crate::EscrowError::PotentialOverflow)

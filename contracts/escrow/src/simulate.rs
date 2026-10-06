@@ -1,13 +1,14 @@
+pub use crate::Escrow;
 use crate::types::{
     ReleaseAuthorization, SimulateCreateContractOutcome, SimulatedDeposit, SimulatedRefund,
     SimulatedRelease,
 };
 use crate::utils::now_seconds;
 use crate::{
-    amount_validation, approvals, refund, ttl, Contract, ContractStatus, DataKey, Error, Escrow,
-    EscrowArgs, EscrowClient, EscrowError, Milestone, MAX_MILESTONES,
+    amount_validation, approvals, refund, ttl, Contract, ContractStatus, DataKey, Error,
+    EscrowClient, EscrowError, Milestone, MAX_MILESTONES,
 };
-use soroban_sdk::{contractimpl, token, Address, Env, Symbol, Vec};
+use soroban_sdk::{token, Address, Env, Symbol, Vec};
 
 fn is_paused(env: &Env) -> bool {
     env.storage()
@@ -21,7 +22,6 @@ fn is_paused(env: &Env) -> bool {
             .unwrap_or(false)
 }
 
-#[contractimpl]
 impl Escrow {
     /// Simulate releasing a milestone without mutating state or transferring tokens.
     ///
